@@ -85,7 +85,7 @@ class Hyperparameters:
     # Feature flags (set to 0 to disable for ablation).
     depth_emb = bool(int(os.environ.get("DEPTH_EMB", "1")))
     attn_res = bool(int(os.environ.get("ATTN_RES", "1")))
-    attn_res_heads = int(os.environ.get("ATTN_RES_HEADS", 4))
+    attn_res_heads = int(os.environ.get("ATTN_RES_HEADS", 0))  # 0 = auto (uses num_heads)
     attn_res_window = int(os.environ.get("ATTN_RES_WINDOW", 0))  # 0 = unlimited history
     swiglu = bool(int(os.environ.get("SWIGLU", "1")))
 
@@ -711,7 +711,8 @@ class GPT(nn.Module):
 
         # --- AttnRes: cross-attention over prior pass outputs (replaces U-Net skips) ---
         if use_attn_res:
-            self.attn_res = AttnRes(model_dim, num_heads=attn_res_heads)
+            actual_attn_res_heads = attn_res_heads if attn_res_heads > 0 else num_heads
+            self.attn_res = AttnRes(model_dim, num_heads=actual_attn_res_heads)
             # No U-Net skip weights when using AttnRes
             self.num_encoder_passes = 0
             self.num_decoder_passes = 0
