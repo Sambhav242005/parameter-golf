@@ -10,6 +10,9 @@ MODIFICATIONS from baseline:
   2. 32K VOCAB SUPPORT: Set VOCAB_SIZE=32768 and point TOKENIZER_PATH at a 32k BPE model.
      Larger tokens cover more bytes → lower bits-per-byte at same loss.
      Default still 1024 so baseline runs unchanged.
+  3. DEPTH_EMB=1: Learnable per-pass embedding so the shared block specializes per iteration.
+  4. ATTN_RES=1: Cross-attention over all prior pass outputs replaces fixed U-Net skips.
+  5. SWIGLU=1: SwiGLU gated activation replaces squared-ReLU in the MLP.
 """
 
 from __future__ import annotations
@@ -78,6 +81,13 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+
+    # Feature flags (set to 0 to disable for ablation).
+    depth_emb = bool(int(os.environ.get("DEPTH_EMB", "1")))
+    attn_res = bool(int(os.environ.get("ATTN_RES", "1")))
+    attn_res_heads = int(os.environ.get("ATTN_RES_HEADS", 4))
+    attn_res_window = int(os.environ.get("ATTN_RES_WINDOW", 0))  # 0 = unlimited history
+    swiglu = bool(int(os.environ.get("SWIGLU", "1")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -237,10 +247,7 @@ def eval_val(
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
-    # Cap validation at ~4096 sequences for speed
-    MAX_VAL_SEQS = 4096
-    seq_end = min(seq_end, seq_start + MAX_VAL_SEQS)
-
+    
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -287,7 +294,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,attn_res_scale",
     ).split(",")
     if pattern
 )
@@ -585,25 +592,60 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool = False):
         super().__init__()
         hidden = mlp_mult * dim
+        self.use_swiglu = use_swiglu
         self.fc = CastedLinear(dim, hidden, bias=False)
+        if use_swiglu:
+            self.gate = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.use_swiglu:
+            return self.proj(F.silu(self.gate(x)) * self.fc(x))
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
+class AttnRes(nn.Module):
+    """Cross-attention over all prior pass outputs (replaces fixed U-Net skips)."""
+    def __init__(self, dim: int, num_heads: int = 4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, dim, bias=False)
+        self.c_v = CastedLinear(dim, dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
+        self.attn_res_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor, history: list[Tensor]) -> Tensor:
+        if not history:
+            return x
+        # Stack history: [B, P, T, D] where P = number of prior passes
+        kv_src = torch.stack(history, dim=1)
+        B, P, T, D = kv_src.shape
+        kv_flat = kv_src.reshape(B, P * T, D)
+
+        q = self.c_q(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(kv_flat).reshape(B, P * T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(kv_flat).reshape(B, P * T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        y = y.transpose(1, 2).contiguous().reshape(B, T, D)
+        return x + self.attn_res_scale.to(dtype=x.dtype)[None, None, :] * self.proj(y)
+
+
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int, rope_base: float, qk_gain_init: float, use_swiglu: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -640,6 +682,11 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        depth_emb: bool = False,
+        use_attn_res: bool = False,
+        attn_res_heads: int = 4,
+        attn_res_window: int = 0,
+        use_swiglu: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -649,21 +696,36 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.num_passes = num_passes
+        self.use_attn_res = use_attn_res
+        self.attn_res_window = attn_res_window
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+
+        # --- Depth embeddings: learnable per-pass embedding so the shared block specializes ---
+        self.depth_emb = nn.Embedding(num_passes, model_dim) if depth_emb else None
 
         # --- Single shared block (the key change) ---
         # This block's weights are reused on every pass through the network.
         # Stored once → drastically smaller compressed artifact.
-        self.block = Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+        self.block = Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_swiglu=use_swiglu)
 
-        # U-Net skip connections: first half of passes are "encoder", second half "decoder".
-        # Each decoder pass adds a weighted skip from the corresponding encoder pass.
-        self.num_encoder_passes = num_passes // 2
-        self.num_decoder_passes = num_passes - self.num_encoder_passes
-        self.num_skip_weights = min(self.num_encoder_passes, self.num_decoder_passes)
-        # per-pass learned skip scale (small, stays in fp32)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # --- AttnRes: cross-attention over prior pass outputs (replaces U-Net skips) ---
+        if use_attn_res:
+            self.attn_res = AttnRes(model_dim, num_heads=attn_res_heads)
+            # No U-Net skip weights when using AttnRes
+            self.num_encoder_passes = 0
+            self.num_decoder_passes = 0
+            self.num_skip_weights = 0
+            self.skip_weights = nn.Parameter(torch.empty(0, dtype=torch.float32))
+        else:
+            self.attn_res = None
+            # U-Net skip connections: first half of passes are "encoder", second half "decoder".
+            # Each decoder pass adds a weighted skip from the corresponding encoder pass.
+            self.num_encoder_passes = num_passes // 2
+            self.num_decoder_passes = num_passes - self.num_encoder_passes
+            self.num_skip_weights = min(self.num_encoder_passes, self.num_decoder_passes)
+            # per-pass learned skip scale (small, stays in fp32)
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
 
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -675,6 +737,8 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
+        if self.depth_emb is not None:
+            nn.init.normal_(self.depth_emb.weight, mean=0.0, std=0.02)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
@@ -684,18 +748,35 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x  # original embedding, passed to every block call
 
-        skips: list[Tensor] = []
+        if self.use_attn_res:
+            # AttnRes mode: collect history, cross-attend each pass
+            history: list[Tensor] = [x0]  # seed with embedding
+            for p in range(self.num_passes):
+                if self.depth_emb is not None:
+                    x = x + self.depth_emb.weight[p][None, None, :]
+                src = history[-self.attn_res_window:] if self.attn_res_window > 0 else history
+                x = self.attn_res(x, src)
+                x = self.block(x, x0)
+                history.append(x)
+        else:
+            # U-Net skip mode (original)
+            skips: list[Tensor] = []
 
-        # Encoder passes: run the shared block, store skip activations
-        for _ in range(self.num_encoder_passes):
-            x = self.block(x, x0)
-            skips.append(x)
+            # Encoder passes: run the shared block, store skip activations
+            for p in range(self.num_encoder_passes):
+                if self.depth_emb is not None:
+                    x = x + self.depth_emb.weight[p][None, None, :]
+                x = self.block(x, x0)
+                skips.append(x)
 
-        # Decoder passes: add skip from encoder mirror, then run shared block
-        for i in range(self.num_decoder_passes):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.block(x, x0)
+            # Decoder passes: add skip from encoder mirror, then run shared block
+            for i in range(self.num_decoder_passes):
+                p = self.num_encoder_passes + i
+                if self.depth_emb is not None:
+                    x = x + self.depth_emb.weight[p][None, None, :]
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.block(x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -815,6 +896,11 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        depth_emb=args.depth_emb,
+        use_attn_res=args.attn_res,
+        attn_res_heads=args.attn_res_heads,
+        attn_res_window=args.attn_res_window,
+        use_swiglu=args.swiglu,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -825,8 +911,10 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # --- CHANGE 4: optimizer now points at base_model.block instead of base_model.blocks ---
+    # --- CHANGE 4: optimizer now points at base_model.block (+ attn_res if enabled) ---
     block_named_params = list(base_model.block.named_parameters())
+    if base_model.attn_res is not None:
+        block_named_params += [(f"attn_res.{n}", p) for n, p in base_model.attn_res.named_parameters()]
     matrix_params = [
         p
         for name, p in block_named_params
@@ -839,6 +927,8 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if base_model.depth_emb is not None:
+        scalar_params.append(base_model.depth_emb.weight)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
 
@@ -877,6 +967,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}  num_passes:{args.num_passes}")
+    log0(f"features: depth_emb={args.depth_emb} attn_res={args.attn_res} swiglu={args.swiglu}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
