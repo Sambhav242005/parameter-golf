@@ -1108,26 +1108,36 @@ def main() -> None:
 
         # Training step
         model.train()
-        torch.cuda.synchronize()
 
         zero_grad_all()
         train_loss_accum = torch.zeros((), device=device)
 
+        t_data_sum, t_fwd_sum, t_bwd_sum = 0.0, 0.0, 0.0
+
         for micro_step in range(grad_accum_steps):
+            t_start = time.perf_counter()
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            t_data_sum += time.perf_counter() - t_start
+
+            t_start = time.perf_counter()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            t_fwd_sum += time.perf_counter() - t_start
+
+            t_start = time.perf_counter()
             (loss * grad_scale).backward()
             train_loss_accum += loss.detach()  # keep as tensor, no GPU sync
+            t_bwd_sum += time.perf_counter() - t_start
 
-        train_loss_accum = train_loss_accum.item() * grad_scale  # single sync after loop
+        # Still an implicit sync here due to .item(), which forces a GPU->CPU copy
+        # This ensures the CPU doesn't run infinitely ahead of the GPU
+        train_loss_accum = train_loss_accum.item() * grad_scale
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
 
-        torch.cuda.synchronize()
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
         # Momentum warmup for Muon
@@ -1142,11 +1152,14 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * mul
 
+        t_start = time.perf_counter()
         for opt in optimizers:
             opt.step()
+        t_opt = time.perf_counter() - t_start
 
         if master_process and (step + 1) % args.train_log_every == 0:
-            log0(f"step:{step + 1}/{args.iterations} train_loss:{train_loss_accum:.4f} lr_mul:{mul:.4f} train_time:{elapsed_ms:.0f}ms")
+            log0(f"step:{step + 1}/{args.iterations} train_loss:{train_loss_accum:.4f} lr_mul:{mul:.4f} train_time:{elapsed_ms:.0f}ms\n"
+                 f"     timing -> data:{t_data_sum:.3f}s fwd:{t_fwd_sum:.3f}s bwd:{t_bwd_sum:.3f}s opt:{t_opt:.3f}s")
 
         step += 1
 
