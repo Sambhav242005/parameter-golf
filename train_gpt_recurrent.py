@@ -628,25 +628,33 @@ class AttnRes(nn.Module):
     def forward(self, x: Tensor, history: list[Tensor]) -> Tensor:
         if not history:
             return x
-        # Stack history: [B, P, T, D] where P = number of prior passes
-        kv_src = torch.stack(history, dim=1)
+        # history is [x0, x1, ...]
+        kv_src = torch.stack(history, dim=1)  # (B, P, T, D)
         B, P, T, D = kv_src.shape
-        kv_flat = kv_src.reshape(B, P * T, D)
-
+        
+        # Interleave time and passes: (B, T, P, D) -> (B, T * P, D)
+        kv_flat = kv_src.transpose(1, 2).contiguous().reshape(B, T * P, D)
+        
         x_norm = F.rms_norm(x, (x.size(-1),))
         kv_norm = F.rms_norm(kv_flat, (kv_flat.size(-1),))
-
-        q = self.c_q(x_norm).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(kv_norm).reshape(B, P * T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(kv_norm).reshape(B, P * T, self.num_heads, self.head_dim).transpose(1, 2)
-
-        q = F.rms_norm(q, (q.size(-1),))
+        
+        # Query calculation on original shape
+        q_orig = self.c_q(x_norm).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        q_norm = F.rms_norm(q_orig, (q_orig.size(-1),))
+        
+        # Expand q to match interleaved layout: shape (B, H, T * P, D_h)
+        q = q_norm.unsqueeze(3).expand(-1, -1, -1, P, -1).contiguous().reshape(B, self.num_heads, T * P, self.head_dim)
+        
+        k = self.c_k(kv_norm).reshape(B, T * P, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(kv_norm).reshape(B, T * P, self.num_heads, self.head_dim).transpose(1, 2)
+        
         k = F.rms_norm(k, (k.size(-1),))
-
-        mask = torch.ones(T, T, dtype=torch.bool, device=q.device).tril()
-        mask = mask.repeat(1, kv_src.size(1))
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        y = y.transpose(1, 2).contiguous().reshape(B, T, D)
+        
+        # Native Flash Attention handles standard causal sequence natively!
+        y_flat = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
+        # Extract the final pass step for each temporal time slice
+        y = y_flat[:, :, P-1::P, :].transpose(1, 2).contiguous().reshape(B, T, D)
         return x + self.attn_res_scale.to(dtype=x.dtype)[None, None, :] * self.proj(y)
 
 
