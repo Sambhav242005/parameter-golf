@@ -653,7 +653,8 @@ class AttnRes(nn.Module):
         # This is a block-causal mask.
         mask = torch.ones(T, T * P, device=x.device, dtype=torch.bool).tril(diagonal=0)
         # expand mask for the P dimension: each temporal query step t sees all P historical steps for each t' <= t
-        mask = mask.repeat_interleave(P, dim=1).unsqueeze(0).unsqueeze(0) # (1, 1, T, T*P)
+        # We need a boolean mask of shape (1, 1, T, T*P) to broadcast against (B, H, T, T*P)
+        mask = mask.repeat_interleave(P, dim=1).view(1, 1, T, T * P)
 
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=False)
         y = y.transpose(1, 2).contiguous().reshape(B, T, D)
