@@ -633,11 +633,19 @@ class AttnRes(nn.Module):
         B, P, T, D = kv_src.shape
         kv_flat = kv_src.reshape(B, P * T, D)
 
-        q = self.c_q(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(kv_flat).reshape(B, P * T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(kv_flat).reshape(B, P * T, self.num_heads, self.head_dim).transpose(1, 2)
+        x_norm = F.rms_norm(x, (x.size(-1),))
+        kv_norm = F.rms_norm(kv_flat, (kv_flat.size(-1),))
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+        q = self.c_q(x_norm).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(kv_norm).reshape(B, P * T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(kv_norm).reshape(B, P * T, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = F.rms_norm(q, (q.size(-1),))
+        k = F.rms_norm(k, (k.size(-1),))
+
+        mask = torch.ones(T, T, dtype=torch.bool, device=q.device).tril()
+        mask = mask.repeat(1, kv_src.size(1))
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         y = y.transpose(1, 2).contiguous().reshape(B, T, D)
         return x + self.attn_res_scale.to(dtype=x.dtype)[None, None, :] * self.proj(y)
 
@@ -655,7 +663,7 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        x = x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
