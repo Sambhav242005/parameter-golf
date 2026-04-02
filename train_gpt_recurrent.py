@@ -829,6 +829,11 @@ def main() -> None:
     enable_mem_efficient_sdp(True)  # required for AttnRes block-causal mask
     enable_math_sdp(True)
 
+    # AttnRes block-causal mask creates (T, T*P) attention patterns that exceed
+    # Triton's default max block size during inductor compilation.
+    import torch._inductor.runtime.triton_heuristics as _th
+    _th.TRITON_MAX_BLOCK["X"] = 8192
+
     logfile = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
