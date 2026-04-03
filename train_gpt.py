@@ -761,7 +761,7 @@ class GPT(nn.Module):
                 x = self.attn_res(x, src)
                 x = self.block(x, x0)
                 history.append(x)
-                if p in (self.num_passes // 3, 2 * self.num_passes // 3):
+                if self.training and p in (self.num_passes // 3, 2 * self.num_passes // 3):
                     aux_x = self.final_norm(x).reshape(-1, x.size(-1))
                     if self.tie_embeddings:
                         aux_logits_proj = F.linear(aux_x, self.tok_emb.weight)
@@ -1088,9 +1088,9 @@ def main() -> None:
 
         # Training step
         model.train()
-        # FIX: synchronize before starting timer so elapsed_ms is accurate
+        # FIX: synchronize before starting timer so step timing is accurate
         torch.cuda.synchronize()
-        t0 = time.perf_counter()
+        step_t0 = time.perf_counter()
 
         zero_grad_all()
         train_loss_accum = torch.zeros((), device=device)
@@ -1111,6 +1111,7 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
 
         torch.cuda.synchronize()
+        step_time_ms = 1000.0 * (time.perf_counter() - step_t0)
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
         if step < args.muon_momentum_warmup_steps:
@@ -1129,7 +1130,7 @@ def main() -> None:
         zero_grad_all()
 
         if master_process and (step + 1) % args.train_log_every == 0:
-            log0(f"step:{step + 1}/{args.iterations} train_loss:{train_loss_accum:.4f} lr_mul:{mul:.4f} train_time:{elapsed_ms:.0f}ms")
+            log0(f"step:{step + 1}/{args.iterations} train_loss:{train_loss_accum:.4f} lr_mul:{mul:.4f} train_time:{step_time_ms:.0f}ms")
 
         step += 1
 
