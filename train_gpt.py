@@ -913,9 +913,7 @@ class GPT(nn.Module):
 
         if actual_embed_dim != model_dim:
             self.emb_up = CastedLinear(actual_embed_dim, model_dim, bias=False)
-            self.emb_up._zero_init = True
             self.emb_down = CastedLinear(model_dim, actual_embed_dim, bias=False)
-            self.emb_down._zero_init = True
         else:
             self.emb_up = None
             self.emb_down = None
