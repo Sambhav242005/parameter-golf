@@ -79,9 +79,11 @@ The key insight is **compute is free, storage is not**. In the 16MB budget:
 
 This frees budget to go wider (`MODEL_DIM=768` vs baseline `512`), which improves bpb more than going deeper with independent layers.
 
-## Planned Next Steps
+## Feature Status
 
-- Pass depth embeddings: `self.pass_emb = nn.Embedding(num_passes, model_dim)` so the shared block can specialize per depth
-- AttnRes: replace fixed U-Net skips with learned attention over all prior pass outputs
-- SwiGLU activation instead of squared-ReLU
-- Scale to `MODEL_DIM=1024` to use more of the 16MB budget
+| Feature | Status |
+|---|---|
+| **Pass depth embeddings** (`depth_emb`) | ✅ Done (line 826, default ON) |
+| **SwiGLU activation** | ✅ Done as option (`ACTIVATION=swiglu`, default `leaky_relu_sq`) |
+| **AttnRes** (attention over prior pass outputs) | ❌ Not implemented (uses fixed weighted skips) |
+| **MODEL_DIM=1024** | ❌ Default 512 (env-overrideable) |
